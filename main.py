@@ -1,11 +1,11 @@
 import imaplib
 import smtplib
 import email
-import openai
-import os
-import time
 from email.message import EmailMessage
 from dotenv import load_dotenv
+import os
+import time
+from openai import OpenAI 
 
 # === Load Environment Variables ===
 load_dotenv()
@@ -17,7 +17,8 @@ EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-openai.api_key = OPENAI_API_KEY
+# ✅ Initialize OpenAI Client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # === GPT-4 Email Reply Generator ===
 def generate_reply(request_text):
@@ -29,7 +30,7 @@ def generate_reply(request_text):
         f"Email content:\n\"\"\"\n{request_text.strip()}\n\"\"\""
     )
 
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-4",
         messages=[
             {"role": "system", "content": "You are a polite and proactive email assistant."},
@@ -38,7 +39,8 @@ def generate_reply(request_text):
         temperature=0.7
     )
 
-    return response.choices[0].message['content'].strip()
+    return response.choices[0].message.content.strip()
+
 
 # === Infinite Loop to Check Emails Every 5 Seconds ===
 while True:

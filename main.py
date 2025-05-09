@@ -1,15 +1,14 @@
 import imaplib
 import smtplib
 import email
-from email.message import EmailMessage
 import openai
-from dotenv import load_dotenv
 import os
+import time
+from email.message import EmailMessage
+from dotenv import load_dotenv
 
 # === Load Environment Variables ===
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
 
 IMAP_SERVER = 'imap.gmail.com'
 SMTP_SERVER = 'smtp.gmail.com'
@@ -17,7 +16,6 @@ SMTP_SERVER = 'smtp.gmail.com'
 EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ALLOWED_SENDER = os.getenv("ALLOWED_SENDER")
 
 openai.api_key = OPENAI_API_KEY
 
@@ -27,7 +25,7 @@ def generate_reply(request_text):
         "You are an AI assistant replying to business emails. "
         "Generate a complete, helpful, and professional email reply based on the content below. "
         "If details are missing, make intelligent assumptions and provide a confident, informative response. "
-        "Sign off as Safwaan Sohail, Software Engineer.\n\n"
+        "Sign off as Krisha Khatri, Digital Marketing Analyst.\n\n"
         f"Email content:\n\"\"\"\n{request_text.strip()}\n\"\"\""
     )
 
@@ -42,59 +40,57 @@ def generate_reply(request_text):
 
     return response.choices[0].message['content'].strip()
 
+# === Infinite Loop to Check Emails Every 5 Seconds ===
+while True:
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+        mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+        mail.select('inbox')
 
+        status, messages = mail.search(None, '(UNSEEN)')
+        email_ids = messages[0].split()
 
+        if email_ids:
+            print(f"📨 {len(email_ids)} unread emails found.")
+        else:
+            print("✅ No new emails. Checking again in 5 seconds...")
 
-# === Connect to Gmail and Search Unread Emails ===
-mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-mail.select('inbox')
+        for e_id in email_ids:
+            _, msg_data = mail.fetch(e_id, '(RFC822)')
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
 
-status, messages = mail.search(None, '(UNSEEN)')
-email_ids = messages[0].split()
+            from_addr = email.utils.parseaddr(msg['From'])[1]
+            subject = msg['Subject'] or "No Subject"
+            body = ""
 
-print(f"📨 {len(email_ids)} unread emails found.")
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain' and 'attachment' not in str(part.get("Content-Disposition", "")):
+                        body = part.get_payload(decode=True).decode()
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode()
 
-# === Process Each Unread Email ===
-for e_id in email_ids:
-    _, msg_data = mail.fetch(e_id, '(RFC822)')
-    raw_email = msg_data[0][1]
-    msg = email.message_from_bytes(raw_email)
+            print(f"✉️ Reading email from {from_addr} with subject: {subject}")
 
-    from_addr = email.utils.parseaddr(msg['From'])[1]
+            ai_reply = generate_reply(body)
 
-    # Only respond to allowed sender
-    if from_addr.lower() != ALLOWED_SENDER.lower():
-        print(f"⏭️ Skipping email from: {from_addr}")
-        continue
+            reply = EmailMessage()
+            reply['From'] = EMAIL_ACCOUNT
+            reply['To'] = from_addr
+            reply['Subject'] = f"Re: {subject}"
+            reply.set_content(ai_reply)
 
-    subject = msg['Subject'] or "No Subject"
-    body = ""
+            with smtplib.SMTP_SSL(SMTP_SERVER, 465) as smtp:
+                smtp.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+                smtp.send_message(reply)
 
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == 'text/plain' and 'attachment' not in str(part.get("Content-Disposition", "")):
-                body = part.get_payload(decode=True).decode()
-                break
-    else:
-        body = msg.get_payload(decode=True).decode()
+            print(f"✅ Replied to {from_addr} with GPT-4 response.")
 
-    print(f"✉️ Reading email from {from_addr} with subject: {subject}")
+        mail.logout()
 
-    ai_reply = generate_reply(body)
+    except Exception as e:
+        print(f"⚠️ Error occurred: {e}")
 
-    reply = EmailMessage()
-    reply['From'] = EMAIL_ACCOUNT
-    reply['To'] = from_addr
-    reply['Subject'] = f"Re: {subject}"
-    reply.set_content(ai_reply)
-
-    # Send reply via Gmail SMTP
-    with smtplib.SMTP_SSL(SMTP_SERVER, 465) as smtp:
-        smtp.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-        smtp.send_message(reply)
-
-    print(f"✅ Replied to {from_addr} with GPT-4 response.")
-
-# Close IMAP connection
-mail.logout()
+    time.sleep(5)

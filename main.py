@@ -5,7 +5,7 @@ from email.message import EmailMessage
 from dotenv import load_dotenv
 import os
 import time
-from openai import OpenAI 
+from openai import OpenAI
 
 # === Load Environment Variables ===
 load_dotenv()

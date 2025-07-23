@@ -5,148 +5,180 @@ from email.message import EmailMessage
 from dotenv import load_dotenv
 import os
 import time
+import json
 import requests
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from flight_info_extractor import validate_extraction, format_flight_results
 
 # === Load Environment Variables ===
 load_dotenv()
-
-IMAP_SERVER = 'imap.gmail.com'
-SMTP_SERVER = 'smtp.gmail.com'
 
 EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ✅ Initialize OpenAI Client
-client = OpenAI(api_key=OPENAI_API_KEY)
+AFFILIATE_ID = os.getenv("AFFILIATE_ID")
+ORG_ID = os.getenv("ORG_ID")
+ADULT = int(os.getenv("ADULT", "1"))
+CHILD = int(os.getenv("CHILD", "0"))
+TRIP_TYPE = os.getenv("TRIP_TYPE", "1").strip()
 
-# === Flight API Fetcher ===
-def get_flight_details():
-    url = "https://neoflightapi.dev.futuretravelplatform.com/search/options"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "Adult": 1,
-        "Child": 0,
-        "TripType": "1",
-        "TripTypeKey": "ONEWAY",
-        "AffiliateId": "2412310726013014383",
-        "OrgId": "2212051818221653784",
-        "Segments": [
-            {
-                "Origin": "CAI",
-                "Destination": "JED",
-                "Date": "27 May 2025",
-                "Class": "Y"
-            }
-        ]
-    }
+llm = ChatOpenAI(model="gpt-4", temperature=0.3)
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+# === Logger ===
+def log(msg):
+    with open("logs.txt", "a") as f:
+        f.write(f"{time.ctime()} | {msg}\n")
 
-        if isinstance(data, list) and len(data) > 0:
-            flight = data[0]
-            return {
-                "flight_number": flight.get("fnm"),
-                "origin": flight.get("dac"),
-                "destination": flight.get("adc"),
-                "departure_time": flight.get("dti"),
-                "arrival_time": flight.get("ati"),
-                "airline": flight.get("mcc"),
-                "price": flight.get("act", ["?"])[0]
-            }
-        else:
-            return None
-    except Exception as e:
-        return {"error": str(e)}
+# === Email Handling ===
+def fetch_unread_emails():
+    mail = imaplib.IMAP4_SSL('imap.gmail.com')
+    mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+    mail.select("inbox")
+    result, data = mail.search(None, '(UNSEEN)')
+    if result != "OK":
+        return []
 
-# === GPT-4 Email Reply Generator ===
-def generate_reply(request_text, flight_info=None):
-    prompt = (
-        "You are an AI assistant replying to business emails. "
-        "Generate a complete, helpful, and professional reply based on the content below. "
-        "If details are missing, make intelligent assumptions and provide a confident response.\n\n"
-        f"Email content:\n\"\"\"\n{request_text.strip()}\n\"\"\""
-    )
-
-    if flight_info and "flight_number" in flight_info:
-        prompt += (
-            "\n\nFlight details (from live system):\n"
-            f"- Flight: {flight_info['flight_number']} ({flight_info['airline']})\n"
-            f"- From: {flight_info['origin']} to {flight_info['destination']}\n"
-            f"- Departs at: {flight_info['departure_time']} and arrives at: {flight_info['arrival_time']}\n"
-            f"- Price: ${flight_info['price']} USD"
-        )
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a polite and proactive email assistant."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
-    )
-
-    return response.choices[0].message.content.strip()
-
-# === Infinite Loop to Check Emails Every 5 Seconds ===
-while True:
-    try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-        mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-        mail.select('inbox')
-
-        status, messages = mail.search(None, '(UNSEEN)')
-        email_ids = messages[0].split()
-
-        if email_ids:
-            print(f"📨 {len(email_ids)} unread emails found.")
-        else:
-            print("✅ No new emails. Checking again in 5 seconds...")
-
-        for e_id in email_ids:
-            _, msg_data = mail.fetch(e_id, '(RFC822)')
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
-
-            from_addr = email.utils.parseaddr(msg['From'])[1]
-            subject = msg['Subject'] or "No Subject"
+    emails = []
+    for num in data[0].split():
+        result, data = mail.fetch(num, '(RFC822)')
+        if result == "OK":
+            raw_email = data[0][1]
+            message = email.message_from_bytes(raw_email)
+            sender = message["From"]
+            subject = message["Subject"]
             body = ""
-
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == 'text/plain' and 'attachment' not in str(part.get("Content-Disposition", "")):
+            if message.is_multipart():
+                for part in message.walk():
+                    if part.get_content_type() == "text/plain":
                         body = part.get_payload(decode=True).decode()
                         break
             else:
-                body = msg.get_payload(decode=True).decode()
+                body = message.get_payload(decode=True).decode()
+            emails.append((sender, subject, body))
+    return emails
 
-            print(f"✉️ Reading email from {from_addr} with subject: {subject}")
+def send_reply(to_email, subject, body):
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg["Subject"] = f"Re: {subject}"
+    msg["From"] = EMAIL_ACCOUNT
+    msg["To"] = to_email
 
-            # Fetch flight info (can add filters later)
-            flight_info = get_flight_details()
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        server.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+        server.send_message(msg)
 
-            # Generate AI-powered reply
-            ai_reply = generate_reply(body, flight_info)
+# === Extract Flight Request from Email ===
+def extract_flight_details(email_text: str) -> dict:
+    query = f"""
+You are a helpful travel assistant.
 
-            reply = EmailMessage()
-            reply['From'] = EMAIL_ACCOUNT
-            reply['To'] = from_addr
-            reply['Subject'] = f"Re: {subject}"
-            reply.set_content(ai_reply)
+Extract flight search information from the following message:
+\"\"\"{email_text}\"\"\"
 
-            with smtplib.SMTP_SSL(SMTP_SERVER, 465) as smtp:
-                smtp.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
-                smtp.send_message(reply)
+Return a JSON object with the following keys:
+- "origin": IATA airport code of the departure city (e.g., "SYD")
+- "destination": IATA airport code of the arrival city (e.g., "DXB")
+- "date": Departure date in the format "DD MMM YYYY" (e.g., "27 Jul 2025")
 
-            print(f"✅ Replied to {from_addr} with GPT-4 + flight data response.")
+Make sure to:
+- Convert city names to correct IATA codes
+- Convert date phrases like "next Friday" into the correct date format
 
-        mail.logout()
+Example Input:
+"Looking to fly from Sydney to Dubai next Friday"
 
+Example Output:
+{{
+  "origin": "SYD",
+  "destination": "DXB",
+  "date": "26 Jul 2025"
+}}
+
+Only return the JSON object.
+"""
+    response = llm.invoke(query)
+    try:
+        json_str = response.content[response.content.find("{"):]
+        return json.loads(json_str)
+    except Exception:
+        return {}
+
+# === Call Flight API ===
+def get_flight_info_dynamic(origin, destination, date):
+    url = "https://neoflightapi.dev.futuretravelplatform.com/search/options"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip, deflate, br",
+        "User-Agent": "PostmanRuntime/7.44.0",
+        "org_id": ORG_ID,
+        "secretkey": os.getenv("FLIGHT_SECRET_KEY")
+    }
+    payload = {
+        "Adult": ADULT,
+        "Child": CHILD,
+        "TripType": TRIP_TYPE,
+        "AffiliateId": AFFILIATE_ID,
+        "OrgId": ORG_ID,
+        "Segments": [{
+            "Origin": origin,
+            "Destination": destination,
+            "Date": date,
+            "Class": "Y"
+        }]
+    }
+
+    try:
+        print("Calling API with payload:", json.dumps(payload, indent=2))
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        print("API raw response:", response.text[:1000])
+        return response.json().get("fop", [])[:5]
     except Exception as e:
-        print(f"⚠️ Error occurred: {e}")
+        print("API call failed:", e)
+        return []
 
-    time.sleep(5)
+# === Travel Package Prompt (Optional) ===
+def get_travel_package_req_template():
+    template = """<PASTE YOUR PROVIDED TRAVEL PACKAGE TEMPLATE HERE>"""
+    return template
+
+# === Main Loop ===
+if __name__ == "__main__":
+    print("Starting LLM Email AutoResponder...")
+    log("System started")
+
+    while True:
+        print("Checking for unread emails...")
+        emails = fetch_unread_emails()
+        print(f"Found {len(emails)} unread email(s).")
+        log(f"Found {len(emails)} unread email(s).")
+
+        for sender, subject, content in emails:
+            sender_email = sender.lower().split()[-1].strip("<>")
+            print(f"Responding to: {sender_email} | Subject: {subject}")
+            log(f"Responding to: {sender_email} | Subject: {subject}")
+
+            try:
+                extracted = extract_flight_details(content)
+
+                validation_msg = validate_extraction(extracted)
+                if "Missing" in validation_msg:
+                    send_reply(sender_email, subject, validation_msg)
+                    log(f"Missing data: {validation_msg}")
+                    continue
+
+                flights = get_flight_info_dynamic(
+                    extracted['origin'], extracted['destination'], extracted['date']
+                )
+                reply = format_flight_results(flights)
+                send_reply(sender_email, subject, reply)
+                log(f"Replied to {sender_email}")
+            except Exception as e:
+                error_msg = f"Error responding to {sender_email}: {e}"
+                print(error_msg)
+                log(error_msg)
+
+        time.sleep(60)  # Reduced polling frequency
